@@ -113,7 +113,10 @@ def default_config_parser(file_path, options):
     else:
         sep = file_path.find("-")
         cfg = Config.fromfile(os.path.join(file_path[:sep], file_path[sep + 1 :]))
-
+    #if not os.path.isfile(file_path):
+        #raise FileNotFoundError(f'File "{file_path}" does not exist.')
+    #cfg = Config.fromfile(file_path)
+    
     if options is not None:
         cfg.merge_from_dict(options)
 

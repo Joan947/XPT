@@ -21,7 +21,6 @@ class ScanNetPPDataset(DefaultDataset):
         "coord",
         "color",
         "normal",
-        "superpoint",
         "segment",
         "instance",
     ]
@@ -59,9 +58,6 @@ class ScanNetPPDataset(DefaultDataset):
 
         if "normal" in data_dict.keys():
             data_dict["normal"] = data_dict["normal"].astype(np.float32)
-
-        if "superpoint" in data_dict.keys():
-            data_dict["superpoint"] = data_dict["superpoint"].astype(np.int32)
 
         if not self.multilabel:
             if "segment" in data_dict.keys():

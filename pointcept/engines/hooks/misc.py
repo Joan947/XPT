@@ -11,7 +11,6 @@ import os
 import shutil
 import time
 import gc
-import wandb
 import torch
 import torch.utils.data
 from collections import OrderedDict
@@ -25,6 +24,7 @@ from pointcept.utils.comm import is_main_process, synchronize
 from pointcept.utils.cache import shared_dict
 from pointcept.utils.scheduler import CosineScheduler
 import pointcept.utils.comm as comm
+#from pointcept.engines.test import TESTERS
 
 from .default import HookBase
 from .builder import HOOKS
@@ -86,10 +86,6 @@ class InformationWriter(HookBase):
     def before_train(self):
         self.trainer.comm_info["iter_info"] = ""
         self.curr_iter = self.trainer.start_epoch * len(self.trainer.train_loader)
-        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
-            wandb.define_metric("params/*", step_metric="Iter")
-            wandb.define_metric("train_batch/*", step_metric="Iter")
-            wandb.define_metric("train/*", step_metric="Epoch")
 
     def before_step(self):
         self.curr_iter += 1
@@ -124,19 +120,6 @@ class InformationWriter(HookBase):
                     self.trainer.storage.history(key).val,
                     self.curr_iter,
                 )
-            if self.trainer.cfg.enable_wandb:
-
-                wandb.log(
-                    {"Iter": self.curr_iter, "params/lr": lr}, step=self.curr_iter
-                )
-                for key in self.model_output_keys:
-                    wandb.log(
-                        {
-                            "Iter": self.curr_iter,
-                            f"train_batch/{key}": self.trainer.storage.history(key).val,
-                        },
-                        step=wandb.run.step,
-                    )
 
     def after_epoch(self):
         epoch_info = "Train result: "
@@ -152,17 +135,6 @@ class InformationWriter(HookBase):
                     self.trainer.storage.history(key).avg,
                     self.trainer.epoch + 1,
                 )
-
-            if self.trainer.cfg.enable_wandb:
-
-                for key in self.model_output_keys:
-                    wandb.log(
-                        {
-                            "Epoch": self.trainer.epoch + 1,
-                            f"train/{key}": self.trainer.storage.history(key).avg,
-                        },
-                        step=wandb.run.step,
-                    )
 
 
 @HOOKS.register_module()
@@ -280,15 +252,19 @@ class PreciseEvaluator(HookBase):
         self.test_last = test_last
 
     def after_train(self):
-        from pointcept.engines.test import TESTERS
-
         self.trainer.logger.info(
             ">>>>>>>>>>>>>>>> Start Precise Evaluation >>>>>>>>>>>>>>>>"
         )
         torch.cuda.empty_cache()
+        
+        # Defer the import to here so that by the time this is called,
+        # pointcept.engines.test is fully loaded.
+        from pointcept.engines.test import TESTERS
+        
         cfg = self.trainer.cfg
-        test_cfg = dict(cfg=cfg, model=self.trainer.model, **cfg.test)
-        tester = TESTERS.build(test_cfg)
+        tester = TESTERS.build(
+            dict(type=cfg.test.type, cfg=cfg, model=self.trainer.model)
+        )
         if self.test_last:
             self.trainer.logger.info("=> Testing on model_last ...")
         else:
@@ -297,15 +273,8 @@ class PreciseEvaluator(HookBase):
                 self.trainer.cfg.save_path, "model", "model_best.pth"
             )
             checkpoint = torch.load(best_path, weights_only=False)
-            weight = OrderedDict()
-            for key, value in checkpoint["state_dict"].items():
-                if not key.startswith("module."):
-                    key = "module." + key  # xxx.xxx -> module.xxx.xxx
-                # Now all keys contain "module." no matter DDP or not.
-                if comm.get_world_size() == 1:
-                    key = key[7:]  # module.xxx.xxx -> xxx.xxx
-                weight[key] = value
-            tester.model.load_state_dict(weight, strict=True)
+            state_dict = checkpoint["state_dict"]
+            tester.model.load_state_dict(state_dict, strict=True)
         tester.test()
 
 

@@ -24,6 +24,7 @@ from pointcept.models.builder import MODELS
 from pointcept.models.utils.misc import offset2bincount
 from pointcept.models.utils.structure import Point
 from pointcept.models.modules import PointModule, PointSequential
+from pointcept.models.dynamic_tanh import DynamicTanh
 
 
 class RPE(torch.nn.Module):
@@ -47,6 +48,116 @@ class RPE(torch.nn.Module):
         out = out.permute(0, 3, 1, 2)  # (N, K, K, H) -> (N, H, K, K)
         return out
 
+class RotaryEmbedding3D(nn.Module):
+    def __init__(self, dim, base=10000, device=None):
+        """
+        Args:
+            dim (int): Head dimension. Must be divisible by 6.
+            base (float): Base value for frequency calculation.
+        """
+        super().__init__()
+        if dim % 6 != 0:
+            raise ValueError(f"Dimension {dim} must be divisible by 6 for 3D RoPE.")
+        self.dim = dim
+        self.dim_per_coord = dim // 3  # Dimension allocated for RoPE along one coordinate (e.g., X)
+        self.base = base
+        self.device = device
+
+        # Precompute inverse frequencies
+        # Each coordinate (X, Y, Z) will use self.dim_per_coord features.
+        # RoPE operates on pairs, so inv_freq is for self.dim_per_coord / 2 pairs.
+        inv_freq = 1.0 / (base ** (torch.arange(0, self.dim_per_coord, 2, device=device).float() / self.dim_per_coord))
+        self.register_buffer("inv_freq", inv_freq, persistent=False) # (dim_per_coord / 2)
+
+    def _apply_rope_single_coord(self, x, cos_emb, sin_emb):
+        """
+        Apply RoPE for a single coordinate to a part of the input tensor.
+        Args:
+            x (Tensor): Input tensor part, shape (..., seq_len, dim_per_coord)
+            cos_emb (Tensor): Cosine embeddings, shape (..., seq_len, dim_per_coord / 2)
+            sin_emb (Tensor): Sine embeddings, shape (..., seq_len, dim_per_coord / 2)
+        Returns:
+            Tensor: Rotated tensor part.
+        """
+        # Reshape x to (..., seq_len, dim_per_coord / 2, 2)
+        x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
+        x1, x2 = x_reshaped[..., 0], x_reshaped[..., 1]
+
+        # Broadcast cos_emb and sin_emb if necessary (e.g., if x has a head dimension)
+        # If x is (batch, heads, seq_len, dim_per_coord) and cos/sin are (batch, seq_len, dim_per_coord/2),
+        # then unsqueeze cos/sin at dim 1.
+        # Current design assumes cos/sin are already broadcastable or match x's leading dims.
+        # For PTv3, Q/K are (N_patches_or_total_points, H, K_or_1, C_head_part)
+        # Coords are (N_patches_or_total_points, K_or_1, 3)
+        # Cos/Sin embeddings will be (N_patches_or_total_points, K_or_1, C_head_part / 2)
+        # So they need .unsqueeze(1) to match H dimension in Q/K
+        
+        # If cos_emb/sin_emb are (..., K, Dpc/2) and x1/x2 are (..., H, K, Dpc/2), add head dim
+        if x1.dim() > cos_emb.dim(): # Add head dimension
+            cos_emb = cos_emb.unsqueeze(1)
+            sin_emb = sin_emb.unsqueeze(1)
+            
+        rotated_x1 = x1 * cos_emb - x2 * sin_emb
+        rotated_x2 = x1 * sin_emb + x2 * cos_emb
+        
+        return torch.stack((rotated_x1, rotated_x2), dim=-1).flatten(start_dim=-2)
+
+    def forward(self, q, k, coords):
+        """
+        Apply 3D RoPE to query and key tensors.
+        Args:
+            q (Tensor): Query tensor, shape (batch_size, num_heads, seq_len, head_dim) or (total_tokens, num_heads, head_dim)
+            k (Tensor): Key tensor, shape (batch_size, num_heads, seq_len, head_dim) or (total_tokens, num_heads, head_dim)
+            coords (Tensor): Coordinates, shape (batch_size, seq_len, 3) or (total_tokens, 3)
+                               These are the grid_coords.
+        Returns:
+            Tuple[Tensor, Tensor]: Rotated q and k tensors.
+        """
+        # coords: (N, K, 3) or (N_total, 3)
+        # self.inv_freq: (dim_per_coord / 2)
+        # We need t: (N, K, dim_per_coord / 2) or (N_total, dim_per_coord / 2)
+        
+        # Ensure coords are on the same device as inv_freq
+        coords = coords.to(self.inv_freq.device)
+
+        # Add a sequence dimension if coords is (total_tokens, 3) for consistency
+        # This happens in flash attention path where Q/K are (total_tokens, H, C_h)
+        # and coords are (total_tokens, 3). We treat seq_len=1 for each token in this case
+        # for the purpose of generating embeddings, but then apply to the (total_tokens, H, C_h) tensor.
+        # The "sequence" is effectively the flattened batch of points.
+        if q.dim() == 3 and coords.dim() == 2: # Flash path (total_tokens, H, C_h), coords (total_tokens, 3)
+            # Coords: (total_tokens, 3) -> t: (total_tokens, dim_per_coord/2)
+            t_x = coords[..., 0:1] * self.inv_freq
+            t_y = coords[..., 1:2] * self.inv_freq
+            t_z = coords[..., 2:3] * self.inv_freq
+        elif q.dim() == 4 and coords.dim() == 3: # Non-flash path (N_patches, H, K, C_h), coords (N_patches, K, 3)
+            # Coords: (N_patches, K, 3) -> t: (N_patches, K, dim_per_coord/2)
+            t_x = coords[..., None, 0] * self.inv_freq # (N, K, 1) * (Dpc/2) -> (N, K, Dpc/2)
+            t_y = coords[..., None, 1] * self.inv_freq
+            t_z = coords[..., None, 2] * self.inv_freq
+        else:
+            raise ValueError(f"Mismatch in q/k ({q.shape}) and coords ({coords.shape}) dimensions")
+
+        cos_x, sin_x = t_x.cos(), t_x.sin()
+        cos_y, sin_y = t_y.cos(), t_y.sin()
+        cos_z, sin_z = t_z.cos(), t_z.sin()
+
+        # Split q and k along the head dimension for X, Y, Z parts
+        q_chunks = q.split(self.dim_per_coord, dim=-1)
+        k_chunks = k.split(self.dim_per_coord, dim=-1)
+
+        q_rotated_x = self._apply_rope_single_coord(q_chunks[0], cos_x, sin_x)
+        q_rotated_y = self._apply_rope_single_coord(q_chunks[1], cos_y, sin_y)
+        q_rotated_z = self._apply_rope_single_coord(q_chunks[2], cos_z, sin_z)
+
+        k_rotated_x = self._apply_rope_single_coord(k_chunks[0], cos_x, sin_x)
+        k_rotated_y = self._apply_rope_single_coord(k_chunks[1], cos_y, sin_y)
+        k_rotated_z = self._apply_rope_single_coord(k_chunks[2], cos_z, sin_z)
+
+        q_out = torch.cat((q_rotated_x, q_rotated_y, q_rotated_z), dim=-1)
+        k_out = torch.cat((k_rotated_x, k_rotated_y, k_rotated_z), dim=-1)
+        
+        return q_out.type_as(q), k_out.type_as(k) # Cast back to original type
 
 class SerializedAttention(PointModule):
     def __init__(
@@ -54,25 +165,37 @@ class SerializedAttention(PointModule):
         channels,
         num_heads,
         patch_size,
+        norm_layer=DynamicTanh,
         qkv_bias=True,
         qk_scale=None,
         attn_drop=0.0,
         proj_drop=0.0,
         order_index=0,
         enable_rpe=False,
+        enable_rope=False, # New flag for RoPE
+        rope_base=10000,   # RoPE base frequency
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
     ):
         super().__init__()
         assert channels % num_heads == 0
+        head_dim = channels // num_heads
+        if enable_rope:
+            assert not enable_rpe, "RoPE and RPE cannot both be enabled."
+            assert head_dim % 6 == 0, "Head dimension must be divisible by 6 for 3D RoPE."
+
         self.channels = channels
         self.num_heads = num_heads
+        # self.norm_q = norm_layer(channels // num_heads)
+        # self.norm_k = norm_layer(channels // num_heads)
         self.scale = qk_scale or (channels // num_heads) ** -0.5
         self.order_index = order_index
         self.upcast_attention = upcast_attention
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
+        self.enable_rope = enable_rope # Store the flag
+
         self.enable_flash = enable_flash
         if enable_flash:
             assert (
@@ -100,6 +223,19 @@ class SerializedAttention(PointModule):
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
+        if self.enable_rope:
+            self.rope = RotaryEmbedding3D(dim=channels // num_heads, base=rope_base)
+        else:
+            self.rope = None
+
+    @torch.no_grad()
+    def get_grid_coords_for_patch(self, point, order_padded):
+        # order_padded are the indices of points after padding and serialization
+        # point.grid_coord are the original grid coordinates
+        # We need the grid_coord for the points in `order_padded`
+        # Shape: (Total padded points, 3)
+        patch_grid_coords = point.grid_coord[order_padded]
+        return patch_grid_coords
 
     @torch.no_grad()
     def get_rel_pos(self, point, order):
@@ -178,6 +314,7 @@ class SerializedAttention(PointModule):
         H = self.num_heads
         K = self.patch_size
         C = self.channels
+        C_head = C // H
 
         pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
 
@@ -186,12 +323,34 @@ class SerializedAttention(PointModule):
 
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
-
+        # print(f"===========================================qkv shape: {qkv.shape}==================================================")
         if not self.enable_flash:
             # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
             q, k, v = (
                 qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
             )
+            #applying normalization
+            # q = self.norm_q(q)
+            # k = self.norm_k(k)
+            # print(f"===========================================q per head shape: {q.shape}==================================================")
+            # print(f"===========================================k per head shape: {k.shape}==================================================")
+            
+            # q = self.norm_q(q.reshape(-1,K,C_head)).reshape(-1, H, K, C_head) # Apply norm per-head token
+            # k = self.norm_k(k.reshape(-1,K,C_head)).reshape(-1, H, K, C_head) # Apply norm per-head token
+            # print(f"===========================================q shape: {q.shape}==================================================")
+            # print(f"===========================================k shape: {k.shape}==================================================")
+            
+            
+            if self.enable_rope:
+                # Coords for RoPE: (N_patches, K, 3)
+                # These are the grid coordinates of the points within each patch
+                patch_grid_coords = self.get_grid_coords_for_patch(point, order).reshape(-1, K, 3)
+                if self.rope.device != q.device: # Ensure RoPE module is on correct device
+                    self.rope.to(q.device)
+                q_dtype, k_dtype = q.dtype, k.dtype # Store original dtype
+                q, k = self.rope(q.float(), k.float(), patch_grid_coords)
+                q, k = q.to(q_dtype), k.to(k_dtype) # Cast back
+
             # attn
             if self.upcast_attention:
                 q = q.float()
@@ -205,13 +364,51 @@ class SerializedAttention(PointModule):
             attn = self.attn_drop(attn).to(qkv.dtype)
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
         else:
+            qkv_reshaped = qkv.reshape(-1, 3, H, C // H)  # (N', 3, H, C')
+            q, k, v = qkv_reshaped[:, 0], qkv_reshaped[:, 1], qkv_reshaped[:, 2]  # (N', H, C')
+
+            # Apply Norm across last dim
+            # q = self.norm_q(q)
+            # k = self.norm_k(k)
+            # print(f"===========================================q shape: {q.shape}==================================================")
+            # print(f"===========================================k shape: {k.shape}==================================================")
+            
+            # q = self.norm_q(q.reshape(-1, C_head)).reshape(q.shape)
+            # k = self.norm_k(k.reshape(-1, C_head)).reshape(k.shape)
+            print(f"===========================================q per head shape: {q.shape}==================================================")
+            print(f"===========================================k per head shape: {k.shape}==================================================")
+            
+
+            if self.enable_rope:
+                # Coords for RoPE: (N_total_padded, 3)
+                # These are the grid coordinates of each point in the flattened, padded list
+                # q_f, k_f are (N_total_padded, H, C_head)
+                flat_grid_coords = self.get_grid_coords_for_patch(point, order) # (N_total_padded, 3)
+                if self.rope.device != q.device:
+                    self.rope.to(q.device)
+                q_dtype, k_dtype = q.dtype, k.dtype
+                q_f, k_f = self.rope(q.float(), k.float(), flat_grid_coords)
+                q, k = q_f.to(q_dtype), k_f.to(k_dtype)
+
+            # attn
+            # Stack back into shape expected by flash_attn: (N', 3, H, C')
+            qkv_normed = torch.stack([q, k, v], dim=1)
+            print(f"===========================================qkv_normed shape: {qkv_normed.shape}==================================================")
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-                qkv.half().reshape(-1, 3, H, C // H),
+                qkv_normed.half(),
                 cu_seqlens,
                 max_seqlen=self.patch_size,
                 dropout_p=self.attn_drop if self.training else 0,
                 softmax_scale=self.scale,
             ).reshape(-1, C)
+
+            # feat = flash_attn.flash_attn_varlen_qkvpacked_func(
+            #     qkv.half().reshape(-1, 3, H, C // H),
+            #     cu_seqlens,
+            #     max_seqlen=self.patch_size,
+            #     dropout_p=self.attn_drop if self.training else 0,
+            #     softmax_scale=self.scale,
+            # ).reshape(-1, C)
             feat = feat.to(qkv.dtype)
         feat = feat[inverse]
 
@@ -260,12 +457,15 @@ class Block(PointModule):
         attn_drop=0.0,
         proj_drop=0.0,
         drop_path=0.0,
-        norm_layer=nn.LayerNorm,
+        #norm_layer=nn.LayerNorm,
+        norm_layer=DynamicTanh,
         act_layer=nn.GELU,
         pre_norm=True,
         order_index=0,
         cpe_indice_key=None,
         enable_rpe=False,
+        enable_rope=False, # New
+        rope_base=10000,   # New
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
@@ -297,6 +497,8 @@ class Block(PointModule):
             proj_drop=proj_drop,
             order_index=order_index,
             enable_rpe=enable_rpe,
+            enable_rope=enable_rope, # Pass through
+            rope_base=rope_base,
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
@@ -539,6 +741,8 @@ class PointTransformerV3(PointModule):
         pre_norm=True,
         shuffle_orders=True,
         enable_rpe=False,
+        enable_rope=False, # New
+        rope_base=10000, 
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
@@ -565,6 +769,19 @@ class PointTransformerV3(PointModule):
         assert self.cls_mode or self.num_stages == len(dec_channels) + 1
         assert self.cls_mode or self.num_stages == len(dec_num_head) + 1
         assert self.cls_mode or self.num_stages == len(dec_patch_size) + 1
+        if enable_rope:
+            assert not enable_rpe, "RoPE and RPE cannot both be enabled at the model level."
+            # Check head dimensions for RoPE compatibility early
+            for s in range(self.num_stages):
+                head_dim_enc = enc_channels[s] // enc_num_head[s]
+                if head_dim_enc % 6 != 0:
+                    raise ValueError(f"Encoder stage {s}: head_dim {head_dim_enc} not div by 6 for RoPE")
+            if not self.cls_mode:
+                for s in range(len(dec_depths)): # dec_depths has one less element
+                    head_dim_dec = dec_channels[s] // dec_num_head[s]
+                    if head_dim_dec % 6 != 0:
+                        raise ValueError(f"Decoder stage {s}: head_dim {head_dim_dec} not div by 6 for RoPE")
+                    
 
         # norm layers
         if pdnorm_bn:
@@ -582,13 +799,14 @@ class PointTransformerV3(PointModule):
         if pdnorm_ln:
             ln_layer = partial(
                 PDNorm,
-                norm_layer=partial(nn.LayerNorm, elementwise_affine=pdnorm_affine),
+                norm_layer=partial(DynamicTanh, elementwise_affine=pdnorm_affine),
                 conditions=pdnorm_conditions,
                 decouple=pdnorm_decouple,
                 adaptive=pdnorm_adaptive,
             )
         else:
-            ln_layer = nn.LayerNorm
+            #ln_layer = nn.LayerNorm
+            ln_layer = DynamicTanh
         # activation layers
         act_layer = nn.GELU
 
@@ -638,6 +856,8 @@ class PointTransformerV3(PointModule):
                         order_index=i % len(self.order),
                         cpe_indice_key=f"stage{s}",
                         enable_rpe=enable_rpe,
+                        enable_rope=enable_rope, # <<<<< ADDED
+                        rope_base=rope_base,
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
@@ -654,6 +874,7 @@ class PointTransformerV3(PointModule):
             ]
             self.dec = PointSequential()
             dec_channels = list(dec_channels) + [enc_channels[-1]]
+            #dec_channels = list(dec_channels) 
             for s in reversed(range(self.num_stages - 1)):
                 dec_drop_path_ = dec_drop_path[
                     sum(dec_depths[:s]) : sum(dec_depths[: s + 1])
@@ -688,6 +909,8 @@ class PointTransformerV3(PointModule):
                             order_index=i % len(self.order),
                             cpe_indice_key=f"stage{s}",
                             enable_rpe=enable_rpe,
+                            enable_rope=enable_rope, # <<<<< ADDED
+                            rope_base=rope_base,
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,

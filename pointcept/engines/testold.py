@@ -122,8 +122,7 @@ class SemSegTester(TesterBase):
         assert self.test_loader.batch_size == 1
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
-        
-        
+
         batch_time = AverageMeter()
         intersection_meter = AverageMeter()
         union_meter = AverageMeter()
@@ -308,9 +307,7 @@ class SemSegTester(TesterBase):
                 )
             )
 
-       
         logger.info("Syncing ...")
-        
         comm.synchronize()
         record_sync = comm.gather(record, dst=0)
 

@@ -1,14 +1,15 @@
 """
-Point Transformer - V3 Mode2
+Point Transformer - V3 Mode1
 
 Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
+from functools import partial
 from addict import Dict
+import math
 import torch
 import torch.nn as nn
-from torch.nn.init import trunc_normal_
 import spconv.pytorch as spconv
 import torch_scatter
 from timm.layers import DropPath
@@ -18,25 +19,11 @@ try:
 except ImportError:
     flash_attn = None
 
+from pointcept.models.point_prompt_training import PDNorm
 from pointcept.models.builder import MODELS
 from pointcept.models.utils.misc import offset2bincount
 from pointcept.models.utils.structure import Point
 from pointcept.models.modules import PointModule, PointSequential
-from pointcept.models.dynamic_tanh import DynamicTanh
-
-class LayerScale(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        init_values: float = 1e-5,
-        inplace: bool = False,
-    ) -> None:
-        super().__init__()
-        self.inplace = inplace
-        self.gamma = nn.Parameter(init_values * torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x.mul_(self.gamma) if self.inplace else x * self.gamma
 
 
 class RPE(torch.nn.Module):
@@ -61,154 +48,31 @@ class RPE(torch.nn.Module):
         return out
 
 
-class RotaryEmbedding3D(nn.Module):
-    def __init__(self, dim, base=10000, device=None):
-        """
-        Args:
-            dim (int): Head dimension. Must be divisible by 6.
-            base (float): Base value for frequency calculation.
-        """
-        super().__init__()
-        if dim % 6 != 0:
-            raise ValueError(f"Dimension {dim} must be divisible by 6 for 3D RoPE.")
-        self.dim = dim
-        self.dim_per_coord = dim // 3  # Dimension allocated for RoPE along one coordinate (e.g., X)
-        self.base = base
-        self.device = device
-
-        # Precompute inverse frequencies
-        # Each coordinate (X, Y, Z) will use self.dim_per_coord features.
-        # RoPE operates on pairs, so inv_freq is for self.dim_per_coord / 2 pairs.
-        inv_freq = 1.0 / (base ** (torch.arange(0, self.dim_per_coord, 2, device=device).float() / self.dim_per_coord))
-        self.register_buffer("inv_freq", inv_freq, persistent=False) # (dim_per_coord / 2)
-
-    def _apply_rope_single_coord(self, x, cos_emb, sin_emb):
-        """
-        Apply RoPE for a single coordinate to a part of the input tensor.
-        Args:
-            x (Tensor): Input tensor part, shape (..., seq_len, dim_per_coord)
-            cos_emb (Tensor): Cosine embeddings, shape (..., seq_len, dim_per_coord / 2)
-            sin_emb (Tensor): Sine embeddings, shape (..., seq_len, dim_per_coord / 2)
-        Returns:
-            Tensor: Rotated tensor part.
-        """
-        # Reshape x to (..., seq_len, dim_per_coord / 2, 2)
-        x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
-        x1, x2 = x_reshaped[..., 0], x_reshaped[..., 1]
-
-        # Broadcast cos_emb and sin_emb if necessary (e.g., if x has a head dimension)
-        # If x is (batch, heads, seq_len, dim_per_coord) and cos/sin are (batch, seq_len, dim_per_coord/2),
-        # then unsqueeze cos/sin at dim 1.
-        # Current design assumes cos/sin are already broadcastable or match x's leading dims.
-        # For PTv3, Q/K are (N_patches_or_total_points, H, K_or_1, C_head_part)
-        # Coords are (N_patches_or_total_points, K_or_1, 3)
-        # Cos/Sin embeddings will be (N_patches_or_total_points, K_or_1, C_head_part / 2)
-        # So they need .unsqueeze(1) to match H dimension in Q/K
-        
-        # If cos_emb/sin_emb are (..., K, Dpc/2) and x1/x2 are (..., H, K, Dpc/2), add head dim
-        if x1.dim() > cos_emb.dim(): # Add head dimension
-            cos_emb = cos_emb.unsqueeze(1)
-            sin_emb = sin_emb.unsqueeze(1)
-            
-        rotated_x1 = x1 * cos_emb - x2 * sin_emb
-        rotated_x2 = x1 * sin_emb + x2 * cos_emb
-        
-        return torch.stack((rotated_x1, rotated_x2), dim=-1).flatten(start_dim=-2)
-
-    def forward(self, q, k, coords):
-        """
-        Apply 3D RoPE to query and key tensors.
-        Args:
-            q (Tensor): Query tensor, shape (batch_size, num_heads, seq_len, head_dim) or (total_tokens, num_heads, head_dim)
-            k (Tensor): Key tensor, shape (batch_size, num_heads, seq_len, head_dim) or (total_tokens, num_heads, head_dim)
-            coords (Tensor): Coordinates, shape (batch_size, seq_len, 3) or (total_tokens, 3)
-                               These are the grid_coords.
-        Returns:
-            Tuple[Tensor, Tensor]: Rotated q and k tensors.
-        """
-        # coords: (N, K, 3) or (N_total, 3)
-        # self.inv_freq: (dim_per_coord / 2)
-        # We need t: (N, K, dim_per_coord / 2) or (N_total, dim_per_coord / 2)
-        
-        # Ensure coords are on the same device as inv_freq
-        coords = coords.to(self.inv_freq.device)
-
-        # Add a sequence dimension if coords is (total_tokens, 3) for consistency
-        # This happens in flash attention path where Q/K are (total_tokens, H, C_h)
-        # and coords are (total_tokens, 3). We treat seq_len=1 for each token in this case
-        # for the purpose of generating embeddings, but then apply to the (total_tokens, H, C_h) tensor.
-        # The "sequence" is effectively the flattened batch of points.
-        if q.dim() == 3 and coords.dim() == 2: # Flash path (total_tokens, H, C_h), coords (total_tokens, 3)
-            # Coords: (total_tokens, 3) -> t: (total_tokens, dim_per_coord/2)
-            t_x = coords[..., 0:1] * self.inv_freq
-            t_y = coords[..., 1:2] * self.inv_freq
-            t_z = coords[..., 2:3] * self.inv_freq
-        elif q.dim() == 4 and coords.dim() == 3: # Non-flash path (N_patches, H, K, C_h), coords (N_patches, K, 3)
-            # Coords: (N_patches, K, 3) -> t: (N_patches, K, dim_per_coord/2)
-            t_x = coords[..., None, 0] * self.inv_freq # (N, K, 1) * (Dpc/2) -> (N, K, Dpc/2)
-            t_y = coords[..., None, 1] * self.inv_freq
-            t_z = coords[..., None, 2] * self.inv_freq
-        else:
-            raise ValueError(f"Mismatch in q/k ({q.shape}) and coords ({coords.shape}) dimensions")
-
-        cos_x, sin_x = t_x.cos(), t_x.sin()
-        cos_y, sin_y = t_y.cos(), t_y.sin()
-        cos_z, sin_z = t_z.cos(), t_z.sin()
-
-        # Split q and k along the head dimension for X, Y, Z parts
-        q_chunks = q.split(self.dim_per_coord, dim=-1)
-        k_chunks = k.split(self.dim_per_coord, dim=-1)
-
-        q_rotated_x = self._apply_rope_single_coord(q_chunks[0], cos_x, sin_x)
-        q_rotated_y = self._apply_rope_single_coord(q_chunks[1], cos_y, sin_y)
-        q_rotated_z = self._apply_rope_single_coord(q_chunks[2], cos_z, sin_z)
-
-        k_rotated_x = self._apply_rope_single_coord(k_chunks[0], cos_x, sin_x)
-        k_rotated_y = self._apply_rope_single_coord(k_chunks[1], cos_y, sin_y)
-        k_rotated_z = self._apply_rope_single_coord(k_chunks[2], cos_z, sin_z)
-
-        q_out = torch.cat((q_rotated_x, q_rotated_y, q_rotated_z), dim=-1)
-        k_out = torch.cat((k_rotated_x, k_rotated_y, k_rotated_z), dim=-1)
-        
-        return q_out.type_as(q), k_out.type_as(k) # Cast back to original type
-
-
 class SerializedAttention(PointModule):
     def __init__(
         self,
         channels,
         num_heads,
         patch_size,
-        norm_layer=DynamicTanh,
         qkv_bias=True,
         qk_scale=None,
         attn_drop=0.0,
         proj_drop=0.0,
         order_index=0,
         enable_rpe=False,
-        enable_rope=False, # New flag for RoPE
-        rope_base=10000,   # RoPE base frequency
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
     ):
         super().__init__()
         assert channels % num_heads == 0
-        head_dim = channels // num_heads
-        if enable_rope:
-            assert not enable_rpe, "RoPE and RPE cannot both be enabled."
-            assert head_dim % 6 == 0, "Head dimension must be divisible by 6 for 3D RoPE."
-
         self.channels = channels
         self.num_heads = num_heads
-        self.norm_q = norm_layer(channels // num_heads)
-        self.norm_k = norm_layer(channels // num_heads)
         self.scale = qk_scale or (channels // num_heads) ** -0.5
         self.order_index = order_index
         self.upcast_attention = upcast_attention
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
-        self.enable_rope = enable_rope # Store the flag
         self.enable_flash = enable_flash
         if enable_flash:
             assert (
@@ -236,15 +100,6 @@ class SerializedAttention(PointModule):
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
-        if self.enable_rope:
-            self.rope = RotaryEmbedding3D(dim=channels // num_heads, base=rope_base)
-        else:
-            self.rope = None
-
-    @torch.no_grad()
-    def get_grid_coords_for_patch(self, point, order_padded):
-        patch_grid_coords = point.grid_coord[order_padded]
-        return patch_grid_coords 
 
     @torch.no_grad()
     def get_rel_pos(self, point, order):
@@ -337,21 +192,6 @@ class SerializedAttention(PointModule):
             q, k, v = (
                 qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
             )
-            #applying normalization
-            q = self.norm_q(q)
-            k = self.norm_k(k)
-
-
-            if self.enable_rope:
-                # Coords for RoPE: (N_patches, K, 3)
-                # These are the grid coordinates of the points within each patch
-                patch_grid_coords = self.get_grid_coords_for_patch(point, order).reshape(-1, K, 3)
-                if self.rope.device != q.device: # Ensure RoPE module is on correct device
-                    self.rope.to(q.device)
-                q_dtype, k_dtype = q.dtype, k.dtype # Store original dtype
-                q, k = self.rope(q.float(), k.float(), patch_grid_coords)
-                q, k = q.to(q_dtype), k.to(k_dtype) # Cast back
-
             # attn
             if self.upcast_attention:
                 q = q.float()
@@ -365,28 +205,8 @@ class SerializedAttention(PointModule):
             attn = self.attn_drop(attn).to(qkv.dtype)
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
         else:
-            qkv_reshaped = qkv.reshape(-1, 3, H, C // H)  # (N', 3, H, C')
-            q, k, v = qkv_reshaped[:, 0], qkv_reshaped[:, 1], qkv_reshaped[:, 2]  # (N', H, C')
-            q = self.norm_q(q)
-            k = self.norm_k(k)
-
-            if self.enable_rope:
-                # Coords for RoPE: (N_total_padded, 3)
-                # These are the grid coordinates of each point in the flattened, padded list
-                # q_f, k_f are (N_total_padded, H, C_head)
-                flat_grid_coords = self.get_grid_coords_for_patch(point, order) # (N_total_padded, 3)
-                if self.rope.device != q.device:
-                    self.rope.to(q.device)
-                q_dtype, k_dtype = q.dtype, k.dtype
-                q_f, k_f = self.rope(q.float(), k.float(), flat_grid_coords)
-                q, k = q_f.to(q_dtype), k_f.to(k_dtype)
-
-
-
-            qkv_normed = torch.stack([q, k, v], dim=1)
-            
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-                qkv_normed.half(),
+                qkv.half().reshape(-1, 3, H, C // H),
                 cu_seqlens,
                 max_seqlen=self.patch_size,
                 dropout_p=self.attn_drop if self.training else 0,
@@ -440,16 +260,12 @@ class Block(PointModule):
         attn_drop=0.0,
         proj_drop=0.0,
         drop_path=0.0,
-        layer_scale=None,
-        #norm_layer=nn.LayerNorm,
-        norm_layer= DynamicTanh,
+        norm_layer=nn.LayerNorm,
         act_layer=nn.GELU,
         pre_norm=True,
         order_index=0,
         cpe_indice_key=None,
         enable_rpe=False,
-        enable_rope=False, # New
-        rope_base=10000,   # New
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
@@ -470,12 +286,7 @@ class Block(PointModule):
             norm_layer(channels),
         )
 
-        # self.norm1 = PointSequential(norm_layer(channels, 0.8))
-        self.ls1 = PointSequential(
-            LayerScale(channels, init_values=layer_scale)
-            if layer_scale is not None
-            else nn.Identity()
-        )
+        self.norm1 = PointSequential(norm_layer(channels))
         self.attn = SerializedAttention(
             channels=channels,
             patch_size=patch_size,
@@ -486,18 +297,11 @@ class Block(PointModule):
             proj_drop=proj_drop,
             order_index=order_index,
             enable_rpe=enable_rpe,
-            enable_rope=enable_rope, # Pass through
-            rope_base=rope_base,
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
         )
-        self.norm2 = PointSequential(norm_layer(channels, 0.8))
-        self.ls2 = PointSequential(
-            LayerScale(channels, init_values=layer_scale)
-            if layer_scale is not None
-            else nn.Identity()
-        )
+        self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
             MLP(
                 in_channels=channels,
@@ -516,17 +320,17 @@ class Block(PointModule):
         point = self.cpe(point)
         point.feat = shortcut + point.feat
         shortcut = point.feat
-        # if self.pre_norm:
-        #     point = self.norm1(point)
-        point = self.drop_path(self.ls1(self.attn(point)))
+        if self.pre_norm:
+            point = self.norm1(point)
+        point = self.drop_path(self.attn(point))
         point.feat = shortcut + point.feat
-        # if not self.pre_norm:
-        #     point = self.norm1(point)
+        if not self.pre_norm:
+            point = self.norm1(point)
 
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm2(point)
-        point = self.drop_path(self.ls2(self.mlp(point)))
+        point = self.drop_path(self.mlp(point))
         point.feat = shortcut + point.feat
         if not self.pre_norm:
             point = self.norm2(point)
@@ -534,7 +338,7 @@ class Block(PointModule):
         return point
 
 
-class GridPooling(PointModule):
+class SerializedPooling(PointModule):
     def __init__(
         self,
         in_channels,
@@ -550,6 +354,8 @@ class GridPooling(PointModule):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
+        assert stride == 2 ** (math.ceil(stride) - 1).bit_length()  # 2, 4, 8
+        # TODO: add support to grid pool (any stride)
         self.stride = stride
         assert reduce in ["sum", "mean", "min", "max"]
         self.reduce = reduce
@@ -563,34 +369,49 @@ class GridPooling(PointModule):
             self.act = PointSequential(act_layer())
 
     def forward(self, point: Point):
-        if "grid_coord" in point.keys():
-            grid_coord = point.grid_coord
-        elif {"coord", "grid_size"}.issubset(point.keys()):
-            grid_coord = torch.div(
-                point.coord - point.coord.min(0)[0],
-                point.grid_size,
-                rounding_mode="trunc",
-            ).int()
-        else:
-            raise AssertionError(
-                "[gird_coord] or [coord, grid_size] should be include in the Point"
-            )
-        grid_coord = torch.div(grid_coord, self.stride, rounding_mode="trunc")
-        grid_coord = grid_coord | point.batch.view(-1, 1) << 48
-        grid_coord, cluster, counts = torch.unique(
-            grid_coord,
+        pooling_depth = (math.ceil(self.stride) - 1).bit_length()
+        if pooling_depth > point.serialized_depth:
+            pooling_depth = 0
+        assert {
+            "serialized_code",
+            "serialized_order",
+            "serialized_inverse",
+            "serialized_depth",
+        }.issubset(
+            point.keys()
+        ), "Run point.serialization() point cloud before SerializedPooling"
+
+        code = point.serialized_code >> pooling_depth * 3
+        code_, cluster, counts = torch.unique(
+            code[0],
             sorted=True,
             return_inverse=True,
             return_counts=True,
-            dim=0,
         )
-        grid_coord = grid_coord & ((1 << 48) - 1)
         # indices of point sorted by cluster, for torch_scatter.segment_csr
         _, indices = torch.sort(cluster)
         # index pointer for sorted point, for torch_scatter.segment_csr
         idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
         # head_indices of each cluster, for reduce attr e.g. code, batch
         head_indices = indices[idx_ptr[:-1]]
+        # generate down code, order, inverse
+        code = code[:, head_indices]
+        order = torch.argsort(code)
+        inverse = torch.zeros_like(order).scatter_(
+            dim=1,
+            index=order,
+            src=torch.arange(0, code.shape[1], device=order.device).repeat(
+                code.shape[0], 1
+            ),
+        )
+
+        if self.shuffle_orders:
+            perm = torch.randperm(code.shape[0])
+            code = code[perm]
+            order = order[perm]
+            inverse = inverse[perm]
+
+        # collect information
         point_dict = Dict(
             feat=torch_scatter.segment_csr(
                 self.proj(point.feat)[indices], idx_ptr, reduce=self.reduce
@@ -598,43 +419,32 @@ class GridPooling(PointModule):
             coord=torch_scatter.segment_csr(
                 point.coord[indices], idx_ptr, reduce="mean"
             ),
-            grid_coord=grid_coord,
+            grid_coord=point.grid_coord[head_indices] >> pooling_depth,
+            serialized_code=code,
+            serialized_order=order,
+            serialized_inverse=inverse,
+            serialized_depth=point.serialized_depth - pooling_depth,
             batch=point.batch[head_indices],
         )
-        if "origin_coord" in point.keys():
-            point_dict["origin_coord"] = torch_scatter.segment_csr(
-                point.origin_coord[indices], idx_ptr, reduce="mean"
-            )
+
         if "condition" in point.keys():
             point_dict["condition"] = point.condition
         if "context" in point.keys():
             point_dict["context"] = point.context
-        if "name" in point.keys():
-            point_dict["name"] = point.name
-        if "split" in point.keys():
-            point_dict["split"] = point.split
-        if "color" in point.keys():
-            point_dict["color"] = torch_scatter.segment_csr(
-                point.color[indices], idx_ptr, reduce="mean"
-            )
-        if "grid_size" in point.keys():
-            point_dict["grid_size"] = point.grid_size * self.stride
 
         if self.traceable:
             point_dict["pooling_inverse"] = cluster
             point_dict["pooling_parent"] = point
-        order = point.order
         point = Point(point_dict)
         if self.norm is not None:
             point = self.norm(point)
         if self.act is not None:
             point = self.act(point)
-        point.serialization(order=order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
         return point
 
 
-class GridUnpooling(PointModule):
+class SerializedUnpooling(PointModule):
     def __init__(
         self,
         in_channels,
@@ -662,15 +472,12 @@ class GridUnpooling(PointModule):
         assert "pooling_parent" in point.keys()
         assert "pooling_inverse" in point.keys()
         parent = point.pop("pooling_parent")
-        inverse = point.pooling_inverse
-        feat = point.feat
-
+        inverse = point.pop("pooling_inverse")
+        point = self.proj(point)
         parent = self.proj_skip(parent)
-        parent.feat = parent.feat + self.proj(point).feat[inverse]
-        parent.sparse_conv_feat = parent.sparse_conv_feat.replace_feature(parent.feat)
+        parent.feat = parent.feat + point.feat[inverse]
 
         if self.traceable:
-            point.feat = feat
             parent["unpooling_parent"] = point
         return parent
 
@@ -682,35 +489,33 @@ class Embedding(PointModule):
         embed_channels,
         norm_layer=None,
         act_layer=None,
-        mask_token=False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.embed_channels = embed_channels
 
-        self.stem = PointSequential(linear=nn.Linear(in_channels, embed_channels))
+        # TODO: check remove spconv
+        self.stem = PointSequential(
+            conv=spconv.SubMConv3d(
+                in_channels,
+                embed_channels,
+                kernel_size=5,
+                padding=1,
+                bias=False,
+                indice_key="stem",
+            )
+        )
         if norm_layer is not None:
             self.stem.add(norm_layer(embed_channels), name="norm")
         if act_layer is not None:
             self.stem.add(act_layer(), name="act")
 
-        if mask_token:
-            self.mask_token = nn.Parameter(torch.zeros(1, embed_channels))
-        else:
-            self.mask_token = None
-
     def forward(self, point: Point):
         point = self.stem(point)
-        if "mask" in point.keys():
-            point.feat = torch.where(
-                point.mask.unsqueeze(-1),
-                self.mask_token.to(point.feat.dtype),
-                point.feat,
-            )
         return point
 
 
-@MODELS.register_module("PT-v3m2")
+@MODELS.register_module("PT-v3m1")
 class PointTransformerV3(PointModule):
     def __init__(
         self,
@@ -731,58 +536,67 @@ class PointTransformerV3(PointModule):
         attn_drop=0.0,
         proj_drop=0.0,
         drop_path=0.3,
-        layer_scale=None,
         pre_norm=True,
         shuffle_orders=True,
         enable_rpe=False,
-        enable_rope=False, # New
-        rope_base=10000, 
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
-        traceable=False,
-        mask_token=False,
-        enc_mode=False,
-        freeze_encoder=False,
+        cls_mode=False,
+        pdnorm_bn=False,
+        pdnorm_ln=False,
+        pdnorm_decouple=True,
+        pdnorm_adaptive=False,
+        pdnorm_affine=True,
+        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
+        self.cls_mode = cls_mode
         self.shuffle_orders = shuffle_orders
-        self.enc_mode = enc_mode
-        self.freeze_encoder = freeze_encoder
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
         assert self.num_stages == len(enc_channels)
         assert self.num_stages == len(enc_num_head)
         assert self.num_stages == len(enc_patch_size)
-        assert self.enc_mode or self.num_stages == len(dec_depths) + 1
-        assert self.enc_mode or self.num_stages == len(dec_channels) + 1
-        assert self.enc_mode or self.num_stages == len(dec_num_head) + 1
-        assert self.enc_mode or self.num_stages == len(dec_patch_size) + 1
+        assert self.cls_mode or self.num_stages == len(dec_depths) + 1
+        assert self.cls_mode or self.num_stages == len(dec_channels) + 1
+        assert self.cls_mode or self.num_stages == len(dec_num_head) + 1
+        assert self.cls_mode or self.num_stages == len(dec_patch_size) + 1
 
-        if enable_rope:
-            assert not enable_rpe, "RoPE and RPE cannot both be enabled at the model level."
-            # Check head dimensions for RoPE compatibility early
-            for s in range(self.num_stages):
-                head_dim_enc = enc_channels[s] // enc_num_head[s]
-                if head_dim_enc % 6 != 0:
-                    raise ValueError(f"Encoder stage {s}: head_dim {head_dim_enc} not div by 6 for RoPE")
-            
-
-        # normalization layer
-        #ln_layer = nn.LayerNorm
-        ln_layer = DynamicTanh
+        # norm layers
+        if pdnorm_bn:
+            bn_layer = partial(
+                PDNorm,
+                norm_layer=partial(
+                    nn.BatchNorm1d, eps=1e-3, momentum=0.01, affine=pdnorm_affine
+                ),
+                conditions=pdnorm_conditions,
+                decouple=pdnorm_decouple,
+                adaptive=pdnorm_adaptive,
+            )
+        else:
+            bn_layer = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
+        if pdnorm_ln:
+            ln_layer = partial(
+                PDNorm,
+                norm_layer=partial(nn.LayerNorm, elementwise_affine=pdnorm_affine),
+                conditions=pdnorm_conditions,
+                decouple=pdnorm_decouple,
+                adaptive=pdnorm_adaptive,
+            )
+        else:
+            ln_layer = nn.LayerNorm
         # activation layers
         act_layer = nn.GELU
 
         self.embedding = Embedding(
             in_channels=in_channels,
             embed_channels=enc_channels[0],
-            norm_layer=ln_layer,
+            norm_layer=bn_layer,
             act_layer=act_layer,
-            mask_token=mask_token,
         )
 
         # encoder
@@ -797,11 +611,11 @@ class PointTransformerV3(PointModule):
             enc = PointSequential()
             if s > 0:
                 enc.add(
-                    GridPooling(
+                    SerializedPooling(
                         in_channels=enc_channels[s - 1],
                         out_channels=enc_channels[s],
                         stride=stride[s - 1],
-                        norm_layer=ln_layer,
+                        norm_layer=bn_layer,
                         act_layer=act_layer,
                     ),
                     name="down",
@@ -818,15 +632,12 @@ class PointTransformerV3(PointModule):
                         attn_drop=attn_drop,
                         proj_drop=proj_drop,
                         drop_path=enc_drop_path_[i],
-                        layer_scale=layer_scale,
                         norm_layer=ln_layer,
                         act_layer=act_layer,
                         pre_norm=pre_norm,
                         order_index=i % len(self.order),
                         cpe_indice_key=f"stage{s}",
                         enable_rpe=enable_rpe,
-                        enable_rope=enable_rope, # <<<<< ADDED
-                        rope_base=rope_base,
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
@@ -837,7 +648,7 @@ class PointTransformerV3(PointModule):
                 self.enc.add(module=enc, name=f"enc{s}")
 
         # decoder
-        if not self.enc_mode:
+        if not self.cls_mode:
             dec_drop_path = [
                 x.item() for x in torch.linspace(0, drop_path, sum(dec_depths))
             ]
@@ -850,13 +661,12 @@ class PointTransformerV3(PointModule):
                 dec_drop_path_.reverse()
                 dec = PointSequential()
                 dec.add(
-                    GridUnpooling(
+                    SerializedUnpooling(
                         in_channels=dec_channels[s + 1],
                         skip_channels=enc_channels[s],
                         out_channels=dec_channels[s],
-                        norm_layer=ln_layer,
+                        norm_layer=bn_layer,
                         act_layer=act_layer,
-                        traceable=traceable,
                     ),
                     name="up",
                 )
@@ -872,15 +682,12 @@ class PointTransformerV3(PointModule):
                             attn_drop=attn_drop,
                             proj_drop=proj_drop,
                             drop_path=dec_drop_path_[i],
-                            layer_scale=layer_scale,
                             norm_layer=ln_layer,
                             act_layer=act_layer,
                             pre_norm=pre_norm,
                             order_index=i % len(self.order),
                             cpe_indice_key=f"stage{s}",
                             enable_rpe=enable_rpe,
-                            enable_rope=enable_rope, # <<<<< ADDED
-                            rope_base=rope_base,
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
@@ -888,32 +695,20 @@ class PointTransformerV3(PointModule):
                         name=f"block{i}",
                     )
                 self.dec.add(module=dec, name=f"dec{s}")
-        if self.freeze_encoder:
-            for p in self.embedding.parameters():
-                p.requires_grad = False
-            for p in self.enc.parameters():
-                p.requires_grad = False
-        self.apply(self._init_weights)
-
-    @staticmethod
-    def _init_weights(module):
-        if isinstance(module, nn.Linear):
-            trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, spconv.SubMConv3d):
-            trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
 
     def forward(self, data_dict):
         point = Point(data_dict)
-        point = self.embedding(point)
-
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
+        point = self.embedding(point)
         point = self.enc(point)
-        if not self.enc_mode:
+        if not self.cls_mode:
             point = self.dec(point)
+        # else:
+        #     point.feat = torch_scatter.segment_csr(
+        #         src=point.feat,
+        #         indptr=nn.functional.pad(point.offset, (1, 0)),
+        #         reduce="mean",
+        #     )
         return point
